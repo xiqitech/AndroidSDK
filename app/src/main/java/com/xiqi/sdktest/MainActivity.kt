@@ -168,12 +168,25 @@ class MainActivity : ComponentActivity() {
                             val image = Utils.scaleAndCropImage(bitmap, width, 0)
                             val grayImage = Utils.grayImage(image)
                             val grayArray = Utils.extractGrayscaleArray(grayImage)
-                            val ditheringArray = Utils.applyFloydSteinbergDithering(grayArray, image.width, image.height,128)
+                            val ditheringArray = Utils.applyFloydSteinbergDithering(
+                                grayArray,
+                                image.width,
+                                image.height,
+                                128
+                            )
                             if (ditheringArray.isNotEmpty()) {
                                 val buffer = Utils.booleanArrayToBinaryBuffer(ditheringArray)
                                 printerManager.print(buffer.array())
                             }
                         }
+                    },
+                    onPrintHalfLabelClick = {
+                        val inputStream = assets.open("half_label_test1.png")
+                        val bitmap = BitmapFactory.decodeStream(inputStream)
+                        inputStream.close()
+
+                        printerManager.printHalfLabel(bitmap)
+
                     },
                     onDeviceSelected = { device ->
                         currentConnectingDevice = device
@@ -207,7 +220,8 @@ private fun checkAndRequestPermissions(requestLauncher: ActivityResultLauncher<A
     } else {
         arrayOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION)
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
     }
 
     requestLauncher.launch(permissions) // ✅ 直接调用 launch
@@ -222,7 +236,15 @@ fun Greeting(name: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun BLEScanScreen(devices: List<BluetoothDevice>, connectedDeviceAddress: String?, onScanClick: () -> Unit, onPrintPdfClick: () -> Unit, onPrintPicClick:()->Unit, onDeviceSelected: (BluetoothDevice) -> Unit) {
+fun BLEScanScreen(
+    devices: List<BluetoothDevice>,
+    connectedDeviceAddress: String?,
+    onScanClick: () -> Unit,
+    onPrintPdfClick: () -> Unit,
+    onPrintPicClick: () -> Unit,
+    onPrintHalfLabelClick: () -> Unit,
+    onDeviceSelected: (BluetoothDevice) -> Unit
+) {
     Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
         Column(
             modifier = Modifier
@@ -244,6 +266,12 @@ fun BLEScanScreen(devices: List<BluetoothDevice>, connectedDeviceAddress: String
             ) {
                 Text("Print Pic")
             }
+            Button(
+                onClick = onPrintHalfLabelClick,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Print Half Label")
+            }
             Spacer(modifier = Modifier.height(16.dp))
             DeviceList(devices, connectedDeviceAddress, onDeviceSelected)
         }
@@ -251,10 +279,18 @@ fun BLEScanScreen(devices: List<BluetoothDevice>, connectedDeviceAddress: String
 }
 
 @Composable
-fun DeviceList(devices: List<BluetoothDevice>, connectedDeviceAddress: String?, onDeviceSelected: (BluetoothDevice) -> Unit) {
+fun DeviceList(
+    devices: List<BluetoothDevice>,
+    connectedDeviceAddress: String?,
+    onDeviceSelected: (BluetoothDevice) -> Unit
+) {
     LazyColumn {
         items(devices) { device ->
-            DeviceItem(device, isConnected = (device.address == connectedDeviceAddress), onDeviceSelected)
+            DeviceItem(
+                device,
+                isConnected = (device.address == connectedDeviceAddress),
+                onDeviceSelected
+            )
         }
     }
 }
