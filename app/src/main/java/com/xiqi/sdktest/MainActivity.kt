@@ -36,17 +36,19 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
-import com.xiqi.printersdk.PrinterManager
+import com.xiqi.printersdk.Printer
 import com.xiqi.printersdk.PrinterState
 import com.xiqi.printersdk.PrinterStatus
 import com.xiqi.sdktest.ui.theme.XiqiTestTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
-    private lateinit var printerManager: PrinterManager
+    private lateinit var printer: Printer
+    private var printJob: kotlinx.coroutines.Job? = null
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -55,7 +57,7 @@ class MainActivity : ComponentActivity() {
         var currentConnectingDevice: BluetoothDevice? = null
         var connectedDeviceAddress by mutableStateOf<String?>(null)
 
-        printerManager = PrinterManager(this, object : PrinterManager.BleCallback {
+        printer = Printer(this, object : Printer.BleCallback {
             override fun onDeviceFound(device: BluetoothDevice?) {
                 if (device != null) {
                     if (!foundDevices.any { it.address == device.address }) {
@@ -79,7 +81,7 @@ class MainActivity : ComponentActivity() {
             }
 
             override fun onStatusReport(status: PrinterStatus) {
-                Log.d("PrinterStatus", "Status: $status")
+//                Log.d("PrinterStatus", "Status: $status")
                 runOnUiThread {
                     if (status.isLowBattery) {
                         Toast.makeText(
@@ -102,13 +104,6 @@ class MainActivity : ComponentActivity() {
                             Toast.LENGTH_SHORT
                         ).show()
                     }
-                    if (status.isLowBattery) {
-                        Toast.makeText(
-                            this@MainActivity,
-                            "打印机电量过低，请及时充电",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
                 }
             }
         })
@@ -118,7 +113,7 @@ class MainActivity : ComponentActivity() {
         ) { result ->
             val allGranted = result.values.all { it }
             if (allGranted) {
-                printerManager.startScan(1000) // 权限通过后自动开始扫描
+                printer.startScan(1000) // 权限通过后自动开始扫描
             } else {
                 Toast.makeText(this, "蓝牙权限被拒绝，无法扫描设备", Toast.LENGTH_SHORT).show()
             }
@@ -131,10 +126,9 @@ class MainActivity : ComponentActivity() {
                     connectedDeviceAddress = connectedDeviceAddress,
                     onScanClick = { checkAndRequestPermissions(requestBluetoothPermissions) },
                     onPrintPdfClick = {
-                        CoroutineScope(Dispatchers.IO).launch {
+                        printJob = CoroutineScope(Dispatchers.IO).launch {
                             val list = Utils.pdfToImages(this@MainActivity, "testcard.pdf")
-                            // corp scale image
-                            val width = when (printerManager.deviceType) {
+                            val width = when (printer.deviceType) {
                                 1 -> 384
                                 2 -> 1664
                                 else -> 384
@@ -142,20 +136,28 @@ class MainActivity : ComponentActivity() {
 
                             var index = 1
                             for (bitmap in list) {
-                                waitForIdleState(20000)
                                 Log.d("Print", "Printing image $index/${list.size}")
+
                                 val image = Utils.scaleAndCropImage(bitmap, width, 0)
                                 val grayImage = Utils.grayImage(image)
                                 val buffer = Utils.bitmapToBinaryBuffer(grayImage, 100)
 
-                                printerManager.print(buffer.array())
+                                // 1) 先发起本页打印
+                                printer.print(buffer.array())
+
+                                // 2) 等到状态从 Idle -> 非 Idle（开始了）
+                                waitUntilStarted(timeoutMillis = 2_000)
+
+                                // 3) 再等到状态回到 Idle（本页完成）
+                                waitUntilIdle(timeoutMillis = 60_000)
+
                                 index++
                             }
                         }
                     },
                     onPrintPicClick = {
-                        CoroutineScope(Dispatchers.IO).launch {
-                            val width = when (printerManager.deviceType) {
+                        printJob = CoroutineScope(Dispatchers.IO).launch {
+                            val width = when (printer.deviceType) {
                                 1 -> 384
                                 2 -> 1664
                                 else -> 384
@@ -168,39 +170,56 @@ class MainActivity : ComponentActivity() {
                             val image = Utils.scaleAndCropImage(bitmap, width, 0)
                             val grayImage = Utils.grayImage(image)
                             val grayArray = Utils.extractGrayscaleArray(grayImage)
-                            val ditheringArray = Utils.applyFloydSteinbergDithering(
-                                grayArray,
-                                image.width,
-                                image.height,
-                                128
-                            )
+                            val ditheringArray = Utils.applyFloydSteinbergDithering(grayArray, image.width, image.height,128)
                             if (ditheringArray.isNotEmpty()) {
                                 val buffer = Utils.booleanArrayToBinaryBuffer(ditheringArray)
-                                printerManager.print(buffer.array())
+                                printer.print(buffer.array())
                             }
                         }
                     },
-                    onPrintHalfLabelClick = {
-                        val inputStream = assets.open("half_label_test1.png")
-                        val bitmap = BitmapFactory.decodeStream(inputStream)
-                        inputStream.close()
-
-                        printerManager.printHalfLabel(bitmap)
-
+                    onStopClick = {
+                        // 先取消批量任务，再让设备走 5A04 end=1 的正常结束流程
+                        printJob?.cancel()
+                        printer.stopPrint()
+                        Log.d("Print", "Stop requested")
                     },
                     onDeviceSelected = { device ->
                         currentConnectingDevice = device
-                        printerManager.connectToDevice(device)
+                        printer.connectToDevice(device)
                     }
                 )
             }
         }
     }
 
+    private suspend fun waitUntilStarted(timeoutMillis: Long) {
+        val start = System.currentTimeMillis()
+        // 等待状态从 Idle 变为非 Idle（进入 Printing/Paused 等）
+        while (printer.getState() == PrinterState.Idle) {
+            delay(10)
+            if (System.currentTimeMillis() - start > timeoutMillis) {
+                Log.w("Print", "等待进入打印超时（仍为 Idle），可能设备响应慢")
+                return
+            }
+        }
+    }
+
+    private suspend fun waitUntilIdle(timeoutMillis: Long) {
+        val start = System.currentTimeMillis()
+        while (printer.getState() != PrinterState.Idle) {
+            delay(50)
+            if (System.currentTimeMillis() - start > timeoutMillis) {
+                Log.e("Print", "等待打印完成回到 Idle 超时")
+                return
+            }
+        }
+    }
+
     private suspend fun waitForIdleState(timeoutMillis: Long = 20000) {
         val startTime = System.currentTimeMillis()
-        while (printerManager.getState() != PrinterState.Idle) {
-            delay(100) // 每 100ms 检查一次
+        while (printer.getState() != PrinterState.Idle &&
+            kotlinx.coroutines.currentCoroutineContext().isActive) {
+            kotlinx.coroutines.delay(100)
             if (System.currentTimeMillis() - startTime > timeoutMillis) {
                 Log.e("Print", "等待打印机空闲超时")
                 break
@@ -220,8 +239,7 @@ private fun checkAndRequestPermissions(requestLauncher: ActivityResultLauncher<A
     } else {
         arrayOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
+            Manifest.permission.ACCESS_COARSE_LOCATION)
     }
 
     requestLauncher.launch(permissions) // ✅ 直接调用 launch
@@ -236,15 +254,7 @@ fun Greeting(name: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun BLEScanScreen(
-    devices: List<BluetoothDevice>,
-    connectedDeviceAddress: String?,
-    onScanClick: () -> Unit,
-    onPrintPdfClick: () -> Unit,
-    onPrintPicClick: () -> Unit,
-    onPrintHalfLabelClick: () -> Unit,
-    onDeviceSelected: (BluetoothDevice) -> Unit
-) {
+fun BLEScanScreen(devices: List<BluetoothDevice>, connectedDeviceAddress: String?, onScanClick: () -> Unit, onPrintPdfClick: () -> Unit, onPrintPicClick:()->Unit, onStopClick: () -> Unit, onDeviceSelected: (BluetoothDevice) -> Unit) {
     Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
         Column(
             modifier = Modifier
@@ -267,11 +277,12 @@ fun BLEScanScreen(
                 Text("Print Pic")
             }
             Button(
-                onClick = onPrintHalfLabelClick,
+                onClick = onStopClick,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Print Half Label")
+                Text("Stop Print")
             }
+
             Spacer(modifier = Modifier.height(16.dp))
             DeviceList(devices, connectedDeviceAddress, onDeviceSelected)
         }
@@ -279,18 +290,10 @@ fun BLEScanScreen(
 }
 
 @Composable
-fun DeviceList(
-    devices: List<BluetoothDevice>,
-    connectedDeviceAddress: String?,
-    onDeviceSelected: (BluetoothDevice) -> Unit
-) {
+fun DeviceList(devices: List<BluetoothDevice>, connectedDeviceAddress: String?, onDeviceSelected: (BluetoothDevice) -> Unit) {
     LazyColumn {
         items(devices) { device ->
-            DeviceItem(
-                device,
-                isConnected = (device.address == connectedDeviceAddress),
-                onDeviceSelected
-            )
+            DeviceItem(device, isConnected = (device.address == connectedDeviceAddress), onDeviceSelected)
         }
     }
 }
